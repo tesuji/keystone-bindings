@@ -65,6 +65,7 @@ pub mod ffi;
 pub use ffi::{Arch, Error, Mode, OptionType, OptionValue};
 
 use libc::*;
+use std::ffi::CStr;
 
 // -----------------------------------------------------------------------------------------------
 // Errors
@@ -110,6 +111,8 @@ impl From<MiscError> for KeystoneError {
 pub enum MiscError {
     /// Error returned when a call to `ks_asm` fails.
     KsAsm,
+    /// Allocation fail, possibly `ks_asm` returns NULL.
+    AllocFail,
 }
 
 impl std::error::Error for MiscError {}
@@ -118,6 +121,7 @@ impl std::fmt::Display for MiscError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MiscError::KsAsm => write!(f, "an error occured while calling ks_asm"),
+            MiscError::AllocFail => write!(f, "allocation failed in ks_asm"),
         }
     }
 }
@@ -129,20 +133,36 @@ impl std::fmt::Display for MiscError {
 /// Output object created after assembling instructions.
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct KeystoneOutput {
-    /// Size of the array storing the encoded instructions.
-    pub size: u32,
     /// Number of instructions that were successfully encoded.
-    pub stat_count: u32,
-    /// Array of encoded instructions.
-    pub bytes: Vec<u8>,
+    pub stat_count: size_t,
+    /// Size of the array storing the encoded instructions.
+    size: size_t,
+    /// A pointer of allocated encoded instructions.
+    ptr: *mut u8,
+}
+
+impl KeystoneOutput {
+    /// Returns encoded instructions in bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        let bytes = unsafe { core::slice::from_raw_parts(self.ptr, self.size as _) };
+        bytes
+    }
 }
 
 impl std::fmt::Display for KeystoneOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        for &byte in &self.bytes {
+        for byte in self.as_bytes() {
             f.write_fmt(format_args!("{:02x}", byte))?;
         }
         Ok(())
+    }
+}
+
+impl Drop for KeystoneOutput {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::ks_free(self.ptr);
+        }
     }
 }
 
@@ -165,6 +185,7 @@ impl Keystone {
         let err = unsafe { ffi::ks_open(arch, mode, &mut ks) };
         if err == ffi::Error::OK {
             Ok(Keystone {
+                // FIXME: remove this panick?
                 ks: ks.expect("Got NULL engine from ks_open()"),
             })
         } else {
@@ -195,8 +216,8 @@ impl Keystone {
     /// The resulting machine code depends on the input buffer, its size, a base address and the
     /// number of instructions to encode. The method returns a [`KeystoneOutput`] object that
     /// contains the encoded instructions.
-    pub fn asm(&self, insns: String, address: u64) -> Result<KeystoneOutput> {
-        let insns_cstr = std::ffi::CString::new(insns).unwrap();
+    pub fn asm(&self, insns: &CStr, address: u64) -> Result<KeystoneOutput> {
+        let insns_cstr = insns;
         let mut encoding: *mut c_uchar = std::ptr::null_mut();
         let mut encoding_size: size_t = 0;
         let mut stat_count: size_t = 0;
@@ -211,25 +232,18 @@ impl Keystone {
                 &mut stat_count,
             )
         };
-        if err == 0 {
-            // Converting the output machine code to a Vec<u8>.
-            let insns_slice = unsafe { std::slice::from_raw_parts(encoding, encoding_size) };
-            let insns = insns_slice.to_vec();
-            // Freeing memory allocated by `ks_asm`.
-            unsafe { ffi::ks_free(encoding) };
-            Ok(KeystoneOutput {
-                size: encoding_size.try_into().expect("size_t overflowed u32"),
-                stat_count: stat_count.try_into().expect("size_t overflowed u32"),
-                bytes: insns,
-            })
-        } else {
-            // If an error occured after calling ks_asm, check if an strerrno has been set and
-            // return the corresponding error. Otherwise, just return a generic error.
-            match Error::new(self.ks) {
-                Some(e) => Err(e)?,
-                None => Err(MiscError::KsAsm)?,
-            }
+        if err != 0 {
+            let err = unsafe { ffi::ks_errno(self.ks) };
+            return Err(KeystoneError::Engine(err));
         }
+        if encoding.is_null() {
+            return Err(KeystoneError::Misc(MiscError::AllocFail));
+        }
+        Ok(KeystoneOutput {
+            stat_count: stat_count,
+            size: encoding_size,
+            ptr: encoding,
+        })
     }
 }
 
@@ -258,16 +272,15 @@ mod tests {
             .option(OptionType::SYNTAX, OptionValue::SYNTAX_NASM)
             .expect("Could not set option to nasm syntax");
         // Assemble instructions
-        let output_res = engine.asm("mov ah, 0x80".to_string(), 0);
+        let output_res = engine.asm(c"mov ah, 0x80", 0);
         assert!(output_res.is_ok());
         // Make sure the output object is sane.
         let output = output_res.unwrap();
-        assert_eq!(output.bytes, vec![0xb4, 0x80]);
-        assert_eq!(output.size, 2);
+        assert_eq!(output.as_bytes(), &[0xb4, 0x80]);
         assert_eq!(output.stat_count, 1);
         // Ensure an error is returned when invalid instructions are provided.
         assert_eq!(
-            engine.asm("INVALID".to_string(), 0),
+            engine.asm(c"INVALID", 0),
             Err(KeystoneError::Engine(ffi::Error::ASM_MNEMONICFAIL))
         );
     }
